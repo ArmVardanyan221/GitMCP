@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { MCPModule } from '@orbit-codes/nestjs-mcp';
 import { GitHubModule } from './github/github.module.js';
 import { GitLabModule } from './gitlab/gitlab.module.js';
+import { ApiController } from './api.controller.js';
 
 @Module({
   imports: [
@@ -16,5 +17,6 @@ import { GitLabModule } from './gitlab/gitlab.module.js';
     GitHubModule,
     GitLabModule,
   ],
+  controllers: [ApiController],
 })
 export class AppModule {}
