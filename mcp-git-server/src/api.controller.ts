@@ -1,6 +1,6 @@
 import { Controller, Get, Post, Body, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import Anthropic from '@anthropic-ai/sdk';
+import axios from 'axios';
 import { GitHubService } from './github/github.service.js';
 import { GitLabService } from './gitlab/gitlab.service.js';
 
@@ -18,6 +18,41 @@ interface ToolInfo {
   name: string;
   description: string;
   parameters: Record<string, string>;
+}
+
+// Ollama chat API types
+interface OllamaMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+}
+
+interface OllamaToolCall {
+  function: {
+    name: string;
+    arguments: Record<string, unknown>;
+  };
+}
+
+interface OllamaChatResponse {
+  message: {
+    role: string;
+    content: string;
+    tool_calls?: OllamaToolCall[];
+  };
+  done: boolean;
+}
+
+interface OllamaTool {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: {
+      type: 'object';
+      properties: Record<string, { type: string; description: string }>;
+      required: string[];
+    };
+  };
 }
 
 const TOOL_REGISTRY: ToolInfo[] = [
@@ -130,44 +165,52 @@ const TOOL_REGISTRY: ToolInfo[] = [
   },
 ];
 
-// Claude tool definitions for the AI chat endpoint
-const CLAUDE_TOOLS: Anthropic.Tool[] = TOOL_REGISTRY.map((tool) => ({
-  name: tool.name,
-  description: tool.description,
-  input_schema: {
-    type: 'object' as const,
-    properties: Object.fromEntries(
-      Object.entries(tool.parameters).map(([key, typeStr]) => {
-        const isOptional = typeStr.endsWith('?');
-        const baseType = isOptional ? typeStr.slice(0, -1) : typeStr;
-        return [
-          key,
-          {
-            type: baseType === 'number' ? 'number' : 'string',
-            description: `${key} (${typeStr})`,
-          },
-        ];
-      }),
-    ),
-    required: Object.entries(tool.parameters)
-      .filter(([, typeStr]) => !typeStr.endsWith('?'))
-      .map(([key]) => key),
+// Ollama tool definitions (OpenAI-compatible format)
+const OLLAMA_TOOLS: OllamaTool[] = TOOL_REGISTRY.map((tool) => ({
+  type: 'function',
+  function: {
+    name: tool.name,
+    description: tool.description,
+    parameters: {
+      type: 'object' as const,
+      properties: Object.fromEntries(
+        Object.entries(tool.parameters).map(([key, typeStr]) => {
+          const baseType = typeStr.replace('?', '');
+          return [
+            key,
+            {
+              type: baseType === 'number' ? 'number' : 'string',
+              description: `${key} (${typeStr})`,
+            },
+          ];
+        }),
+      ),
+      required: Object.entries(tool.parameters)
+        .filter(([, typeStr]) => !typeStr.endsWith('?'))
+        .map(([key]) => key),
+    },
   },
 }));
 
 @Controller('api')
 export class ApiController {
   private readonly logger = new Logger(ApiController.name);
-  private readonly anthropic: Anthropic;
+  private readonly ollamaUrl: string;
+  private readonly ollamaModel: string;
 
   constructor(
     private readonly github: GitHubService,
     private readonly gitlab: GitLabService,
     private readonly config: ConfigService,
   ) {
-    this.anthropic = new Anthropic({
-      apiKey: this.config.get<string>('ANTHROPIC_API_KEY'),
-    });
+    this.ollamaUrl = this.config.get<string>(
+      'OLLAMA_URL',
+      'http://localhost:11434',
+    );
+    this.ollamaModel = this.config.get<string>('OLLAMA_MODEL', 'qwen2.5:7b');
+    this.logger.log(
+      `Ollama configured: ${this.ollamaUrl} with model ${this.ollamaModel}`,
+    );
   }
 
   @Get('tools')
@@ -184,8 +227,7 @@ export class ApiController {
       const result = await this.dispatchTool(name, args);
       return { content: [{ type: 'text', text: result }], isError: false };
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`Tool ${name} failed: ${message}`);
       return {
         content: [{ type: 'text', text: `Error: ${message}` }],
@@ -206,95 +248,60 @@ After getting tool results, summarize them in a clear, human-friendly way.
 If the user's request is unclear, ask for clarification.
 Keep responses concise and informative.`;
 
-    const messages: Anthropic.MessageParam[] = [
+    const messages: OllamaMessage[] = [
+      { role: 'system', content: systemPrompt },
       ...history.map((h) => ({
-        role: h.role as 'user' | 'assistant',
+        role: h.role,
         content: h.content,
       })),
       { role: 'user', content: message },
     ];
 
     try {
-      let response = await this.anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 4096,
-        system: systemPrompt,
-        tools: CLAUDE_TOOLS,
-        messages,
-      });
-
-      // Process tool calls in a loop (Claude may call multiple tools)
       const allToolResults: Array<{ tool: string; result: string }> = [];
 
-      while (response.stop_reason === 'tool_use') {
-        const assistantContent = response.content;
-        const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      // Call Ollama with tools
+      let response = await this.callOllama(messages);
 
-        for (const block of assistantContent) {
-          if (block.type !== 'tool_use') continue;
-          const toolName = block.name;
-          const toolInput = block.input as Record<string, unknown>;
-          const toolId = block.id;
+      // Process tool calls in a loop
+      while (response.message.tool_calls?.length) {
+        // Add assistant message with tool calls
+        messages.push({
+          role: 'assistant',
+          content: response.message.content || '',
+        });
+
+        // Execute each tool call and add results
+        for (const toolCall of response.message.tool_calls) {
+          const toolName = toolCall.function.name;
+          const toolInput = toolCall.function.arguments;
 
           this.logger.log(
             `AI calling tool: ${toolName}(${JSON.stringify(toolInput)})`,
           );
+
           try {
             const result = await this.dispatchTool(toolName, toolInput);
             allToolResults.push({ tool: toolName, result });
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: toolId,
+            messages.push({
+              role: 'tool',
               content: result,
             });
           } catch (err) {
             const errorMsg = err instanceof Error ? err.message : String(err);
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: toolId,
+            messages.push({
+              role: 'tool',
               content: `Error: ${errorMsg}`,
-              is_error: true,
             });
           }
         }
 
-        // Continue the conversation with tool results
-        messages.push({
-          role: 'assistant',
-          content: assistantContent.map((block) => {
-            if (block.type === 'tool_use') {
-              return {
-                type: 'tool_use' as const,
-                id: block.id,
-                name: block.name,
-                input: block.input,
-              };
-            }
-            return {
-              type: 'text' as const,
-              text: (block as Anthropic.TextBlock).text,
-            };
-          }),
-        });
-        messages.push({ role: 'user', content: toolResults });
-
-        response = await this.anthropic.messages.create({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 4096,
-          system: systemPrompt,
-          tools: CLAUDE_TOOLS,
-          messages,
-        });
+        // Call Ollama again with tool results
+        response = await this.callOllama(messages);
       }
 
-      // Extract the final text response
-      const textBlocks = response.content.filter(
-        (block): block is Anthropic.TextBlock => block.type === 'text',
-      );
-      const assistantMessage = textBlocks.map((b) => b.text).join('\n');
-
       return {
-        message: assistantMessage,
+        message: response.message.content,
         toolCalls: allToolResults,
       };
     } catch (err) {
@@ -306,6 +313,22 @@ Keep responses concise and informative.`;
         isError: true,
       };
     }
+  }
+
+  private async callOllama(
+    messages: OllamaMessage[],
+  ): Promise<OllamaChatResponse> {
+    const { data } = await axios.post<OllamaChatResponse>(
+      `${this.ollamaUrl}/api/chat`,
+      {
+        model: this.ollamaModel,
+        messages,
+        tools: OLLAMA_TOOLS,
+        stream: false,
+      },
+      { timeout: 120000 },
+    );
+    return data;
   }
 
   private async dispatchTool(
