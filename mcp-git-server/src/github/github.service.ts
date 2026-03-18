@@ -2,6 +2,14 @@ import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Octokit } from '@octokit/rest';
 import { Tool } from '@orbit-codes/nestjs-mcp';
+import type {
+  ListReposParams,
+  GetRepoParams,
+  ListBranchesParams,
+  GetFileParams,
+  ListIssuesParams,
+  CreateIssueParams,
+} from './github.types';
 
 @Injectable()
 export class GitHubService implements OnModuleInit {
@@ -26,12 +34,9 @@ export class GitHubService implements OnModuleInit {
       page: 'number?',
     },
   })
-  async listRepos(params: {
-    username?: string;
-    per_page?: number;
-    page?: number;
-  }) {
-    const { username, per_page = 30, page = 1 } = params ?? {};
+  async listRepos(params: ListReposParams) {
+    const { username, per_page: rawPerPage = 30, page = 1 } = params ?? {};
+    const per_page = Math.min(Math.max(1, rawPerPage), 100);
 
     const response = username
       ? await this.octokit.repos.listForUser({ username, per_page, page })
@@ -66,7 +71,7 @@ export class GitHubService implements OnModuleInit {
       repo: 'string',
     },
   })
-  async getRepo(params: { owner: string; repo: string }) {
+  async getRepo(params: GetRepoParams) {
     const { owner, repo } = params;
     const { data } = await this.octokit.repos.get({ owner, repo });
 
@@ -103,13 +108,9 @@ export class GitHubService implements OnModuleInit {
       page: 'number?',
     },
   })
-  async listBranches(params: {
-    owner: string;
-    repo: string;
-    per_page?: number;
-    page?: number;
-  }) {
-    const { owner, repo, per_page = 30, page = 1 } = params;
+  async listBranches(params: ListBranchesParams) {
+    const { owner, repo, per_page: rawPerPage = 30, page = 1 } = params;
+    const per_page = Math.min(Math.max(1, rawPerPage), 100);
     const { data } = await this.octokit.repos.listBranches({
       owner,
       repo,
@@ -139,12 +140,7 @@ export class GitHubService implements OnModuleInit {
       ref: 'string?',
     },
   })
-  async getFile(params: {
-    owner: string;
-    repo: string;
-    path: string;
-    ref?: string;
-  }) {
+  async getFile(params: GetFileParams) {
     const { owner, repo, path, ref } = params;
     const { data } = await this.octokit.repos.getContent({
       owner,
@@ -194,22 +190,16 @@ export class GitHubService implements OnModuleInit {
       page: 'number?',
     },
   })
-  async listIssues(params: {
-    owner: string;
-    repo: string;
-    state?: 'open' | 'closed' | 'all';
-    labels?: string;
-    per_page?: number;
-    page?: number;
-  }) {
+  async listIssues(params: ListIssuesParams) {
     const {
       owner,
       repo,
       state = 'open',
       labels,
-      per_page = 20,
+      per_page: rawPerPage = 20,
       page = 1,
     } = params;
+    const per_page = Math.min(Math.max(1, rawPerPage), 100);
     const { data } = await this.octokit.issues.listForRepo({
       owner,
       repo,
@@ -249,14 +239,7 @@ export class GitHubService implements OnModuleInit {
       assignees: 'string?',
     },
   })
-  async createIssue(params: {
-    owner: string;
-    repo: string;
-    title: string;
-    body?: string;
-    labels?: string;
-    assignees?: string;
-  }) {
+  async createIssue(params: CreateIssueParams) {
     const { owner, repo, title, body, labels, assignees } = params;
 
     const { data } = await this.octokit.issues.create({

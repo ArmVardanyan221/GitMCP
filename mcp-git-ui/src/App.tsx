@@ -30,8 +30,39 @@ function App() {
   const [showToolPanel, setShowToolPanel] = useState(false);
   const [selectedTool, setSelectedTool] = useState<MCPTool | null>(null);
   const [toolArgs, setToolArgs] = useState<Record<string, string>>({});
+  const [collapsedMessages, setCollapsedMessages] = useState<Set<string>>(new Set());
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const activeRequestRef = useRef<{
+    controller: AbortController;
+    cancelled: boolean;
+  } | null>(null);
+
+  const cancelActiveRequest = () => {
+    if (activeRequestRef.current) {
+      activeRequestRef.current.cancelled = true;
+      activeRequestRef.current.controller.abort();
+      activeRequestRef.current = null;
+    }
+  };
+
+  const handleStop = () => {
+    cancelActiveRequest();
+    setLoading(false);
+    addMessage('system', 'Request cancelled.');
+  };
+
+  const toggleMessage = (id: string) => {
+    setCollapsedMessages((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
 
   const addMessage = useCallback(
     (role: Message['role'], content: string, extra?: Partial<Message>) => {
@@ -84,6 +115,13 @@ function App() {
     };
   }, [addMessage]);
 
+  // Refocus input when loading finishes
+  useEffect(() => {
+    if (!loading && connected) {
+      inputRef.current?.focus();
+    }
+  }, [loading, connected]);
+
   // Auto-scroll to bottom
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -122,7 +160,7 @@ function App() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = input.trim();
-    if (!trimmed || loading) return;
+    if (!trimmed) return;
 
     addMessage('user', trimmed);
     setInput('');
@@ -133,10 +171,15 @@ function App() {
       return;
     }
 
-    // Send to AI chat endpoint — Claude understands any natural language
+    // Cancel any previous in-flight request
+    cancelActiveRequest();
+
+    const controller = new AbortController();
+    const request = { controller, cancelled: false };
+    activeRequestRef.current = request;
     setLoading(true);
+
     try {
-      // Build conversation history from recent messages
       const history = messages
         .filter((m) => m.role === 'user' || m.role === 'assistant')
         .slice(-10)
@@ -146,7 +189,10 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: trimmed, history }),
+        signal: controller.signal,
       });
+
+      if (request.cancelled) return;
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -154,7 +200,8 @@ function App() {
 
       const data: ChatResponse = await response.json();
 
-      // Show which tools were called
+      if (request.cancelled) return;
+
       if (data.toolCalls.length > 0) {
         for (const tc of data.toolCalls) {
           try {
@@ -169,16 +216,20 @@ function App() {
         }
       }
 
-      // Show AI's response
       addMessage('assistant', data.message, { isError: data.isError });
     } catch (err) {
+      if (request.cancelled) return;
+      if (err instanceof DOMException && err.name === 'AbortError') return;
       addMessage(
         'system',
         `Error: ${err instanceof Error ? err.message : String(err)}`,
         { isError: true },
       );
     } finally {
-      setLoading(false);
+      if (!request.cancelled) {
+        activeRequestRef.current = null;
+        setLoading(false);
+      }
     }
   };
 
@@ -204,11 +255,123 @@ function App() {
     setToolArgs({});
   };
 
+  const escapeHtml = (str: string) =>
+    str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
   const renderMarkdown = (text: string) => {
+    const lines = text.split('\n');
+    const result: string[] = [];
+    let inCodeBlock = false;
+    let codeLines: string[] = [];
+    let inList = false;
+
+    for (const line of lines) {
+      // Code block toggle
+      if (line.trim().startsWith('```')) {
+        if (inCodeBlock) {
+          result.push(
+            `<pre class="md-code-block"><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`,
+          );
+          codeLines = [];
+          inCodeBlock = false;
+        } else {
+          if (inList) {
+            result.push('</ul>');
+            inList = false;
+          }
+          inCodeBlock = true;
+        }
+        continue;
+      }
+
+      if (inCodeBlock) {
+        codeLines.push(line);
+        continue;
+      }
+
+      // Headings
+      const headingMatch = line.match(/^(#{1,4})\s+(.+)/);
+      if (headingMatch) {
+        if (inList) {
+          result.push('</ul>');
+          inList = false;
+        }
+        const level = headingMatch[1].length;
+        result.push(
+          `<h${level} class="md-heading md-h${level}">${inlineMarkdown(escapeHtml(headingMatch[2]))}</h${level}>`,
+        );
+        continue;
+      }
+
+      // Horizontal rule
+      if (/^[-*_]{3,}\s*$/.test(line.trim())) {
+        if (inList) {
+          result.push('</ul>');
+          inList = false;
+        }
+        result.push('<hr class="md-hr"/>');
+        continue;
+      }
+
+      // List items (- or * or numbered)
+      const listMatch = line.match(/^\s*[-*]\s+(.+)/);
+      const numListMatch = line.match(/^\s*\d+[.)]\s+(.+)/);
+      if (listMatch || numListMatch) {
+        if (!inList) {
+          result.push('<ul class="md-list">');
+          inList = true;
+        }
+        const content = listMatch ? listMatch[1] : numListMatch![1];
+        result.push(`<li>${inlineMarkdown(escapeHtml(content))}</li>`);
+        continue;
+      }
+
+      // Close list if non-list line
+      if (inList && line.trim() !== '') {
+        result.push('</ul>');
+        inList = false;
+      }
+
+      // Empty line
+      if (line.trim() === '') {
+        if (inList) {
+          result.push('</ul>');
+          inList = false;
+        }
+        result.push('<div class="md-spacer"></div>');
+        continue;
+      }
+
+      // Regular paragraph
+      result.push(`<p class="md-paragraph">${inlineMarkdown(escapeHtml(line))}</p>`);
+    }
+
+    if (inCodeBlock) {
+      result.push(
+        `<pre class="md-code-block"><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`,
+      );
+    }
+    if (inList) {
+      result.push('</ul>');
+    }
+
+    return result.join('');
+  };
+
+  const inlineMarkdown = (text: string) => {
     return text
       .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\n/g, '<br/>');
+      .replace(/\*(.+?)\*/g, '<em>$1</em>')
+      .replace(/`([^`]+)`/g, '<code class="md-inline-code">$1</code>')
+      .replace(
+        /\[([^\]]+)\]\(([^)]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener" class="md-link">$1</a>',
+      );
   };
 
   return (
@@ -243,30 +406,58 @@ function App() {
                 </p>
               </div>
             )}
-            {messages.map((msg) => (
-              <div key={msg.id} className={`message ${msg.role} ${msg.isError ? 'error' : ''}`}>
-                <div className="message-header">
-                  <span className="message-role">
-                    {msg.role === 'user'
-                      ? 'You'
-                      : msg.role === 'assistant'
-                        ? 'AI'
-                        : msg.role === 'system'
-                          ? 'System'
-                          : 'Result'}
-                  </span>
-                  {msg.toolName && <span className="tool-badge">{msg.toolName}</span>}
-                  <span className="message-time">{msg.timestamp.toLocaleTimeString()}</span>
-                </div>
-                <div className="message-body">
-                  {msg.isJson ? (
-                    <pre className="json-output">{msg.content}</pre>
-                  ) : (
-                    <div dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+            {messages.map((msg) => {
+              const isCollapsed = collapsedMessages.has(msg.id);
+              const preview =
+                msg.content.length > 120
+                  ? msg.content.slice(0, 120) + '...'
+                  : null;
+
+              return (
+                <div
+                  key={msg.id}
+                  className={`message ${msg.role} ${msg.isError ? 'error' : ''}`}
+                >
+                  <div
+                    className="message-header"
+                    onClick={() => toggleMessage(msg.id)}
+                  >
+                    <span className={`accordion-arrow ${isCollapsed ? 'collapsed' : ''}`}>
+                      &#9662;
+                    </span>
+                    <span className="message-role">
+                      {msg.role === 'user'
+                        ? 'You'
+                        : msg.role === 'assistant'
+                          ? 'AI'
+                          : msg.role === 'system'
+                            ? 'System'
+                            : 'Result'}
+                    </span>
+                    {msg.toolName && <span className="tool-badge">{msg.toolName}</span>}
+                    {isCollapsed && preview && (
+                      <span className="message-preview">{preview}</span>
+                    )}
+                    <span className="message-time">
+                      {msg.timestamp.toLocaleTimeString()}
+                    </span>
+                  </div>
+                  {!isCollapsed && (
+                    <div className="message-body">
+                      {msg.isJson ? (
+                        <pre className="json-output">{msg.content}</pre>
+                      ) : (
+                        <div
+                          dangerouslySetInnerHTML={{
+                            __html: renderMarkdown(msg.content),
+                          }}
+                        />
+                      )}
+                    </div>
                   )}
                 </div>
-              </div>
-            ))}
+              );
+            })}
             {loading && (
               <div className="message system">
                 <div className="message-body">
@@ -292,11 +483,21 @@ function App() {
                   ? 'Ask anything... (e.g. "show my GitHub repos", "what issues are open in owner/repo?")'
                   : 'Waiting for connection...'
               }
-              disabled={!connected || loading}
+              disabled={!connected}
             />
-            <button type="submit" disabled={!connected || loading || !input.trim()}>
-              Send
-            </button>
+            {loading ? (
+              <button
+                type="button"
+                className="stop-btn"
+                onClick={handleStop}
+              >
+                Stop
+              </button>
+            ) : (
+              <button type="submit" disabled={!connected || !input.trim()}>
+                Send
+              </button>
+            )}
           </form>
         </div>
 

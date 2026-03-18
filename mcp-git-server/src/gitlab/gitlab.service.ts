@@ -1,10 +1,15 @@
-/* eslint-disable @typescript-eslint/no-unsafe-call */
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
-/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance } from 'axios';
 import { Tool } from '@orbit-codes/nestjs-mcp';
+import type {
+  GitLabProject,
+  GitLabProjectDetail,
+  GitLabBranch,
+  GitLabFile,
+  GitLabIssue,
+  GitLabCreatedIssue,
+} from './gitlab.types';
 
 @Injectable()
 export class GitLabService implements OnModuleInit {
@@ -17,9 +22,13 @@ export class GitLabService implements OnModuleInit {
     const baseURL = `${this.config.get<string>('GITLAB_URL', 'https://gitlab.com')}/api/v4`;
     const token = this.config.get<string>('GITLAB_TOKEN');
 
+    if (!token) {
+      this.logger.warn('GITLAB_TOKEN is not set — GitLab API calls will fail');
+    }
+
     this.client = axios.create({
       baseURL,
-      headers: { 'PRIVATE-TOKEN': token ?? '' },
+      headers: token ? { 'PRIVATE-TOKEN': token } : {},
     });
 
     this.logger.log(`GitLab client initialized for ${baseURL}`);
@@ -42,9 +51,15 @@ export class GitLabService implements OnModuleInit {
     per_page?: number;
     page?: number;
   }) {
-    const { search, membership, per_page = 20, page = 1 } = params ?? {};
+    const {
+      search,
+      membership,
+      per_page: rawPerPage = 20,
+      page = 1,
+    } = params ?? {};
+    const per_page = Math.min(Math.max(1, rawPerPage), 100);
 
-    const { data } = await this.client.get('/projects', {
+    const { data } = await this.client.get<GitLabProject[]>('/projects', {
       params: {
         search,
         membership: membership === 'true' ? true : undefined,
@@ -56,7 +71,7 @@ export class GitLabService implements OnModuleInit {
     });
 
     return JSON.stringify(
-      (data as any[]).map((p) => ({
+      data.map((p) => ({
         id: p.id,
         name: p.name,
         path_with_namespace: p.path_with_namespace,
@@ -81,7 +96,9 @@ export class GitLabService implements OnModuleInit {
   })
   async getProject(params: { project_id: string }) {
     const encodedId = encodeURIComponent(params.project_id);
-    const { data } = await this.client.get(`/projects/${encodedId}`);
+    const { data } = await this.client.get<GitLabProjectDetail>(
+      `/projects/${encodedId}`,
+    );
 
     return JSON.stringify(
       {
@@ -122,16 +139,17 @@ export class GitLabService implements OnModuleInit {
     per_page?: number;
     page?: number;
   }) {
-    const { project_id, search, per_page = 30, page = 1 } = params;
+    const { project_id, search, per_page: rawPerPage = 30, page = 1 } = params;
+    const per_page = Math.min(Math.max(1, rawPerPage), 100);
     const encodedId = encodeURIComponent(project_id);
 
-    const { data } = await this.client.get(
+    const { data } = await this.client.get<GitLabBranch[]>(
       `/projects/${encodedId}/repository/branches`,
       { params: { search, per_page, page } },
     );
 
     return JSON.stringify(
-      (data as any[]).map((b) => ({
+      data.map((b) => ({
         name: b.name,
         sha: b.commit?.id,
         commit_message: b.commit?.message?.split('\n')[0],
@@ -163,14 +181,12 @@ export class GitLabService implements OnModuleInit {
     const encodedId = encodeURIComponent(project_id);
     const encodedPath = encodeURIComponent(file_path);
 
-    const { data } = await this.client.get(
+    const { data } = await this.client.get<GitLabFile>(
       `/projects/${encodedId}/repository/files/${encodedPath}`,
       { params: { ref } },
     );
 
-    const content = Buffer.from(data.content as string, 'base64').toString(
-      'utf-8',
-    );
+    const content = Buffer.from(data.content, 'base64').toString('utf-8');
 
     return JSON.stringify(
       {
@@ -209,17 +225,19 @@ export class GitLabService implements OnModuleInit {
       project_id,
       state = 'opened',
       labels,
-      per_page = 20,
+      per_page: rawPerPage = 20,
       page = 1,
     } = params;
+    const per_page = Math.min(Math.max(1, rawPerPage), 100);
     const encodedId = encodeURIComponent(project_id);
 
-    const { data } = await this.client.get(`/projects/${encodedId}/issues`, {
-      params: { state, labels, per_page, page, order_by: 'updated_at' },
-    });
+    const { data } = await this.client.get<GitLabIssue[]>(
+      `/projects/${encodedId}/issues`,
+      { params: { state, labels, per_page, page, order_by: 'updated_at' } },
+    );
 
     return JSON.stringify(
-      (data as any[]).map((issue) => ({
+      data.map((issue) => ({
         iid: issue.iid,
         title: issue.title,
         state: issue.state,
@@ -263,10 +281,11 @@ export class GitLabService implements OnModuleInit {
     if (assignee_ids) {
       payload.assignee_ids = assignee_ids
         .split(',')
-        .map((id) => parseInt(id.trim(), 10));
+        .map((id) => parseInt(id.trim(), 10))
+        .filter((id) => !isNaN(id));
     }
 
-    const { data } = await this.client.post(
+    const { data } = await this.client.post<GitLabCreatedIssue>(
       `/projects/${encodedId}/issues`,
       payload,
     );

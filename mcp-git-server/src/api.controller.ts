@@ -221,6 +221,22 @@ export class ApiController {
   @Post('tools/call')
   async callTool(@Body() body: ToolCallRequest) {
     const { name, arguments: args } = body;
+
+    if (!name || typeof name !== 'string') {
+      return {
+        content: [{ type: 'text', text: 'Error: tool name is required' }],
+        isError: true,
+      };
+    }
+
+    const validToolNames = TOOL_REGISTRY.map((t) => t.name);
+    if (!validToolNames.includes(name)) {
+      return {
+        content: [{ type: 'text', text: `Error: unknown tool "${name}"` }],
+        isError: true,
+      };
+    }
+
     this.logger.log(`Calling tool: ${name}`);
 
     try {
@@ -239,6 +255,15 @@ export class ApiController {
   @Post('chat')
   async chat(@Body() body: ChatRequest) {
     const { message, history = [] } = body;
+
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return {
+        message: 'Error: message is required',
+        toolCalls: [],
+        isError: true,
+      };
+    }
+
     this.logger.log(`Chat request: ${message}`);
 
     const systemPrompt = `You are a helpful Git assistant that can interact with GitHub and GitLab repositories.
@@ -263,8 +288,14 @@ Keep responses concise and informative.`;
       // Call Ollama with tools
       let response = await this.callOllama(messages);
 
-      // Process tool calls in a loop
-      while (response.message.tool_calls?.length) {
+      // Process tool calls in a loop (max 10 iterations to prevent runaway)
+      const MAX_TOOL_ITERATIONS = 10;
+      let iteration = 0;
+      while (
+        response.message.tool_calls?.length &&
+        iteration < MAX_TOOL_ITERATIONS
+      ) {
+        iteration++;
         // Add assistant message with tool calls
         messages.push({
           role: 'assistant',
